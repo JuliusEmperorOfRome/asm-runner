@@ -1,21 +1,15 @@
 .text
 .global _start
-// The code here does a weird thing of 
-// storing the return address in %r15
-// This avoids pushing to stack (which is page aligned, so this matters a lot),
-// and is in general faster. The choise of %r15 is because the sysV abi says %r15
-// is callee preserved, meaning it can be set before entering a loop, and sysV
-// code (which includes syscalls) will not disturb it.
 _start:
     // grow the stack by 4096 and align to 4096
     movq %rsp, %rbp
     movq $-4096, %rax
     andq %rax, %rsp
     addq %rax, %rsp
-    // argc -> %rcx
-    movq (%rbp), %rcx
+    // argc -> %r15, which is not destroyed by syscalls (this program never writes to it again)
+    movq (%rbp), %r15
     // envp - 1 -> %rdx
-    leaq 8(%rbp, %rcx, 8), %rdx
+    leaq 8(%rbp, %r15, 8), %rdx
 
     // find 'PATH='
 .Lpath_loop:
@@ -43,9 +37,6 @@ _start:
 
     // this loop opens path directories to the range (%r12)..(%rbp)
     movq %rbp, %r12
-    // %rbp, %rsp occupied with stack
-    // %rbx - sliced PATH
-    // %r12 - start of fd buffer
 .Ltop:
     // load buffer start
     movq %rsp, %rdx
@@ -73,8 +64,8 @@ _start:
     movl $2, %eax
     syscall
     // the current kernel ABI doesn't allow 64bit fds, and will most likely
-    // never will. But since we're testing the return code anyways, this
-    // only adds 1 instruction and 1 byte.
+    // never will. But since we're testing the return code anyways, checking 
+    // that only adds 1 instruction and 1 byte.
     movq %rax, %rdx
     shrq $32, %rax
     jnz .fail
@@ -85,11 +76,46 @@ _start:
     cmpb $':', -1(%rbx)
     je .Ltop
     
+    // skip pipe/fork/execve if argc <= 1
+    cmpq $1, %r15
+    jbe .Lprint
+
+    // must preserve %rsp for stack
+    // must preserve %rbp and %r12 for dirfd array
+    // must preserve %r15 for argc
+    // %r12-15, %rsp, %rbp, %rbx are preserved across syscalls
+    // so, we can still use %r13 and %r14 to save 4 pipes (2 fds per register)
+
+    // Note: (%rbp) stored argc, we overwrite it. This is why keeping %r15 is important
+    // do first pipe
+    movq %rbp, %rdi
+    movl $22, %eax
+    syscall
+    cmpq $-4096, %rax
+    ja .fail
+    movq (%rbp), %r13
+    // do second pipe
+    movq %rbp, %rdi
+    movl $22, %eax
+    syscall
+    cmpq $-4096, %rax
+    ja .fail
+    movq (%rbp), %r14
+
+    // fork
+    movl $57, %eax
+    syscall
+    cmpq $-4096, %rax
+    ja .fail
+    testq %rax, %rax
+    jnz .Lprint
+
+    // This is the child process
+
     // execve to argc[1] with argc[1..] and envp[..]
     leaq 16(%rbp), %rsi
     movq 16(%rbp), %rdi
-    movq (%rbp), %rdx
-    leaq 16(%rbp, %rdx, 8), %rdx
+    leaq 16(%rbp, %r15, 8), %rdx
     movl $59, %eax
     syscall
 
@@ -101,11 +127,18 @@ _start:
     movl $60, %eax
     syscall
     hlt
-    // Could assume exit never fails and remove the `hlt`
-    // This would then allow deduplicating the `syscall`
-    // This would save a total of 3 bytes (WOW!)
-.checked_syscall:
+.Lprint:
+
+    // repeat wait4(-1,null,0,null) until it fails
+.Lwait:
+    movq $-1, %rdi
+    xorl %esi, %esi
+    xorl %edx, %edx
+    xorl %r10d, %r10d
+    movl $61, %eax
     syscall
     cmpq $-4096, %rax
-    ja .fail
-    jmp *%r15
+    jbe .Lwait
+
+    xorl %eax, %eax
+    jmp .exit

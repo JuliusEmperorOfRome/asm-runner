@@ -64,7 +64,7 @@ _start:
     movl $2, %eax
     syscall
     // the current kernel ABI doesn't allow 64bit fds, and will most likely
-    // never will. But since we're testing the return code anyways, checking 
+    // never will. But since we're testing the return code anyways, checking
     // that only adds 1 instruction and 1 byte.
     movq %rax, %rdx
     shrq $32, %rax
@@ -81,7 +81,7 @@ _start:
     // couldn't open anything in PATH
     cmpq %r12, %rbp
     je .fail
-    
+
     // skip pipe/fork/execve if argc <= 1
     // .Lprint uses %r13 as the write fd and %r14 as the read fd
     movl $1, %r13d
@@ -227,8 +227,48 @@ _start:
     // set %r14 to our read fd
     movl %r14d, %r14d
 .Lprint:
-    // %r12-15 are occupied, %rbx is the only register left that syscalls don't clobber
+    // %r12-15 are occupied, %rbx is the last register that syscalls don't clobber
+    // Since I'm considering adding a -0 option, put the separator in (%rbp)
+    movl $'\n, (%rbp)
+
     // TODO: do the actual printing
+
+    // if argc <= 1, exit right away
+    xorl %edi, %edi
+    cmpq $1, %r15
+    jbe .exit
+
+    // close our write half, so that the other process can get EOF (%r13 is freed)
+    movl %r13d, %edi
+    movl $3, %eax
+    syscall
+    cmpq $-4096, %rax
+    ja .fail
+
+    // set %rbx to the remaining stack capacity and start reading
+    movq %r12, %rbx
+    subq %rsp, %rbx
+.Lread_child:
+    movl %r14d, %edi
+    movq %r12, %rsi
+    subq %rbx, %rsi
+    movq %rbx, %rdx
+    xorl %eax, %eax
+    syscall
+    cmpq $-4096, %rax
+    ja .fail
+    // EOF
+    testq %rax, %rax
+    jz .Lafter_reads
+    // filled buffer
+    cmpq %rbx, %rax
+    je .Lafter_reads
+
+    subq %rax, %rbx
+    jmp .Lread_child
+
+
+.Lafter_reads:
 
     // repeat wait4(-1,null,0,null) until it fails
 .Lwait:

@@ -68,15 +68,24 @@ _start:
     // that only adds 1 instruction and 1 byte.
     movq %rax, %rdx
     shrq $32, %rax
-    jnz .fail
+    // don't fail instantly, maybe the user messed up permissions in their PATH
+    jnz .Lcontinue
 
     subq $4, %r12
     movl %edx, (%r12)
+.Lcontinue:
     addq $1, %rbx
     cmpb $':', -1(%rbx)
     je .Ltop
+
+    // couldn't open anything in PATH
+    cmpq %r12, %rbp
+    je .fail
     
     // skip pipe/fork/execve if argc <= 1
+    // .Lprint uses %r13 as the write fd and %r14 as the read fd
+    movl $1, %r13d
+    xorl %r14d, %r14d
     cmpq $1, %r15
     jbe .Lprint
 
@@ -85,6 +94,7 @@ _start:
     // must preserve %r15 for argc
     // %r12-15, %rsp, %rbp, %rbx are preserved across syscalls
     // so, we can still use %r13 and %r14 to save 4 pipes (2 fds per register)
+    // %rbx stays free for now (was used previously for PATH)
 
     // Note: (%rbp) stored argc, we overwrite it. This is why keeping %r15 is important
     // do first pipe
@@ -102,23 +112,93 @@ _start:
     ja .fail
     movq (%rbp), %r14
 
+    // sysV x64 is little endian, so:
+    //   - r13d has pipe 1 read half
+    //   - r13 >> 32 has pipe 1 write half
+    //   - r14d has pipe 2 read half
+    //   - r14 >> 32 has pipe 2 write half
+    // pipe 1 is for parent -> child
+    // pipe 2 is for child -> parent
+
     // fork
     movl $57, %eax
     syscall
     cmpq $-4096, %rax
     ja .fail
     testq %rax, %rax
-    jnz .Lprint
+    jnz .Lprint_pipes
 
     // This is the child process
 
-    // execve to argc[1] with argc[1..] and envp[..]
-    leaq 16(%rbp), %rsi
-    movq 16(%rbp), %rdi
-    leaq 16(%rbp, %r15, 8), %rdx
-    movl $59, %eax
+    // close(pipe 1 write half)
+    movq %r13, %rdi
+    shrq $32, %rdi
+    movl $3, %eax
     syscall
+    cmpq $-4096, %rax
+    ja .fail
 
+    // close(pipe 2 read half)
+    movl %r14d, %edi
+    movl $3, %eax
+    syscall
+    cmpq $-4096, %rax
+    ja .fail
+
+    // move the pipe 2 write half to %r14d
+    shrq $32, %r14
+
+    // dup2(pipe 1 read half, 0)
+    movl %r13d, %edi
+    xorl %esi, %esi
+    movl $33, %eax
+    syscall
+    cmpq $-4096, %rax
+    ja .fail
+
+    // dup2(pipe 2 write half, 1)
+    movl %r14d, %edi
+    movl $1, %esi
+    movl $33, %eax
+    syscall
+    cmpq $-4096, %rax
+    ja .fail
+
+    // close old fds
+    movl %r13d, %edi
+    movl $3, %eax
+    syscall
+    cmpq $-4096, %rax
+    ja .fail
+
+    movl %r14d, %edi
+    movl $3, %eax
+    syscall
+    cmpq $-4096, %rax
+    ja .fail
+
+    // %r13 and %r14 are finally free.
+    leaq 16(%rbp), %r13
+    leaq 16(%rbp, %r15, 8), %r14
+
+    // tries to execveat into PATH dirs with argv in %r13 and envp in %r14
+    // Notably, if pathname is absolute, then execveat ignores dirfd,
+    // effectively doing an execve.
+.execve:
+    // %rbx points right after the dirfd to use
+    movq %rbp, %rbx
+.Lexecveat:
+    movl -4(%rbx), %edi
+    movq %r13, %rdx
+    movq %r14, %r10
+    movq (%r13), %rsi
+    xorl %r8d, %r8d
+    movl $322, %eax
+    syscall
+    // try next dirfd, if we can
+    subq $4, %rbx
+    cmpq %rbx, %r12
+    jne .Lexecveat
 .fail:
     // set exit code
     movl $1, %edi
@@ -127,7 +207,28 @@ _start:
     movl $60, %eax
     syscall
     hlt
+.Lprint_pipes:
+    // close(%r13d), which is pipe 1 read half
+    movl %r13d, %edi
+    movl $3, %eax
+    syscall
+    cmpq $-4096, %rax
+    ja .fail
+    // close(%r14 >> 32), which is pipe 2 write half
+    movq %r14, %rdi
+    shrq $32, %rdi
+    movl $3, %eax
+    syscall
+    cmpq $-4096, %rax
+    ja .fail
+
+    // set %r13 to our write fd
+    shrq $32, %r13
+    // set %r14 to our read fd
+    movl %r14d, %r14d
 .Lprint:
+    // %r12-15 are occupied, %rbx is the only register left that syscalls don't clobber
+    // TODO: do the actual printing
 
     // repeat wait4(-1,null,0,null) until it fails
 .Lwait:
@@ -140,5 +241,5 @@ _start:
     cmpq $-4096, %rax
     jbe .Lwait
 
-    xorl %eax, %eax
+    xorl %edi, %edi
     jmp .exit

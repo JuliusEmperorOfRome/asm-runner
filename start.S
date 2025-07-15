@@ -269,11 +269,25 @@ _start:
 
 
 .Lafter_reads:
-
-    // repeat wait4(-1,null,0,null) until it fails
+    // close read half
+    movl %r14d, %edi
+    movl $3, %eax
+    syscall
+    cmpq $-4096, %rax
+    ja .fail
+    jmp .Lwait_start
 .Lwait:
+    // WIFEXITED(status) = ((status & 0x7f) == 0)
+    // WEXITSTATUS(status) = ((status & 0xff00) >> 8)
+    // We're testing for successful exit, so
+    // status & 0x7f == 0 and (status & 0xff00) >> 8 == 0
+    // which is equivalent to (status & 0xff7f == 0)
+    testw $0xff7f, (%rbp)
+    jnz .fail
+.Lwait_start:
+    // wait4(-1, (%rsp), 0, 0)
     movq $-1, %rdi
-    xorl %esi, %esi
+    movq %rbp, %rsi
     xorl %edx, %edx
     xorl %r10d, %r10d
     movl $61, %eax

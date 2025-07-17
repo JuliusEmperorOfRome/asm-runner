@@ -40,10 +40,10 @@ _start:
 .Ltop:
     // load buffer start
     // Note: the buffer is intentionally shrunk, so that later we have stack
-    // space for stat/getdents64 syscall structures. With the current file name
-    // size limit of 255 chars + '\0', stat + getdents64 need at least 419
+    // space for getdents64 syscall structures. With the current file name
+    // size limit of 255 chars + '\0', getdents64 need at least 275
     // bytes, but writes may go up to 3 bytes before the buffer, so we need at
-    // least 422 bytes. I like 512, so that's what I chose.
+    // least 278 bytes. I like 512, so that's what I chose.
     leaq 512(%rsp), %rdx
 .Linner:
     // path didn't fit into buffer
@@ -269,18 +269,12 @@ _start:
     // This leaves %rbx, %r15
     // finally, we do getdents64/write loop
     movq %rbp, %r15
-    // "shrink" the stack to allow using offsets in the range [-128, 127],
-    // which allows for much shorter offset encodings
-    // for optimal shrinkage, we need `a` and `b`,
-    //     such that a < 127, b < 127, a + b = 144
-    // one such pair is 72 and 72.
-    // We write 72 bytes below %rsp, but that's in the redzone.
     addq $72, %rsp
 .Lgetdents:
     movl -4(%r15), %edi
-    leaq -72(%r12), %rdx
+    movq %r12, %rdx
     subq %rsp, %rdx
-    leaq 72(%rsp), %rsi
+    movq %rsp, %rsi
     movl $217, %eax
     syscall
     cmpq $-4096, %rax
@@ -288,32 +282,26 @@ _start:
     testq %rax, %rax
     jz .Lgetdents_next_dir
     // We only have %rbx left, but we need 2 register.
-    // Luckily, the ino64_t at 72(%rsp)
-    movq %r12, 72(%rsp)
+    // Luckily, the ino64_t at (%rsp)
+    movq %r12, (%rsp)
     movq %rax, %r12
-    leaq 72(%rsp), %rbx
-.Lstat_loop:
+    leaq (%rsp), %rbx
+.Lfaccess_loop:
     movzbl 18(%rbx), %eax
     // x & ~8 == 0 iff (x == 0 || x == 8)
     testb $-9, %al
-    jz .Ldo_stat
+    jz .Ldo_faccessat
     cmpb $10, %al
-    jne .Lstat_end
-.Ldo_stat:
+    jne .Lfaccessat_end
+.Ldo_faccessat:
+    // X_OK == 1
     movl -4(%r15), %edi
     leaq 19(%rbx), %rsi
-    leaq -72(%rsp), %rdx
-    xorl %r10d, %r10d
-    movl $262, %eax
+    movl $1, %edx
+    movl $269, %eax
     syscall
     testq %rax, %rax
-    jnz .fail
-    // get st_mode at offset 24 (24 - 72 = -48)
-    movl -48(%rsp), %eax
-    // test if (st_mode & (S_IXUSR | S_IFMT)) == (S_IXUSR | S_IFREG)
-    andl $0xf040, %eax
-    cmpl $0x8040, %eax
-    jne .Lstat_end
+    jnz .Lfaccessat_end
 
     // start preparing for write
     movzwl 16(%rbx), %eax
@@ -336,13 +324,13 @@ _start:
     cmpq $-4096, %rax
     ja .fail
 
-.Lstat_end:
+.Lfaccessat_end:
     movzwl 16(%rbx), %eax
     addq %rax, %rbx
     subq %rax, %r12
-    jnz .Lstat_loop
+    jnz .Lfaccess_loop
     // restore %r12 from the unused ino64_t
-    movq 72(%rsp), %r12
+    movq (%rsp), %r12
     jmp .Lgetdents
 .Lgetdents_next_dir:
     subq $4, %r15

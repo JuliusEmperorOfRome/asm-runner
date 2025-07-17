@@ -6,7 +6,7 @@ _start:
     movq $-4096, %rax
     andq %rax, %rsp
     addq %rax, %rsp
-    // argc -> %r15, which is not destroyed by syscalls (this program never writes to it again)
+    // argc -> %r15, which is not destroyed by syscalls
     movq (%rbp), %r15
     // envp - 1 -> %rdx
     leaq 8(%rbp, %r15, 8), %rdx
@@ -39,11 +39,16 @@ _start:
     movq %rbp, %r12
 .Ltop:
     // load buffer start
-    movq %rsp, %rdx
+    // Note: the buffer is intentionally shrunk, so that later we have stack
+    // space for stat/getdents64 syscall structures. With the current file name
+    // size limit of 255 chars + '\0', stat + getdents64 need at least 419
+    // bytes, but writes may go up to 3 bytes before the buffer, so we need at
+    // least 422 bytes. I like 512, so that's what I chose.
+    leaq 512(%rsp), %rdx
 .Linner:
     // path didn't fit into buffer
-    cmpq %rdx, %r12
-    je .fail
+    cmpq %r12, %rdx
+    jae .fail
     movzbl (%rbx), %eax
     cmpb $':', %al
     je .Lopen
@@ -57,9 +62,9 @@ _start:
     // trailing 0
     movb $0, (%rdx)
 
-    // open(%rsp, O_DIRECTORY | O_PATH | O_CLOEXEC, 0)
-    movq %rsp, %rdi
-    movl $0x290000, %esi
+    // open(%rsp, O_DIRECTORY | O_CLOEXEC, 0)
+    leaq 512(%rsp), %rdi
+    movl $0x90000, %esi
     xorl %edx, %edx
     movl $2, %eax
     syscall
@@ -83,9 +88,12 @@ _start:
     je .fail
 
     // skip pipe/fork/execve if argc <= 1
-    // .Lprint uses %r13 as the write fd and %r14 as the read fd
+
+    // .Lprint uses %r13d as write half, %r13 >> 32 as read half
+    // sets write half to 1 for stdout, and set upper bits to 0 for stdin
     movl $1, %r13d
-    xorl %r14d, %r14d
+    // comparing against %r13 would be 1 byte smaller,
+    // but would introduce a dependency
     cmpq $1, %r15
     jbe .Lprint
 
@@ -96,21 +104,20 @@ _start:
     // so, we can still use %r13 and %r14 to save 4 pipes (2 fds per register)
     // %rbx stays free for now (was used previously for PATH)
 
-    // Note: (%rbp) stored argc, we overwrite it. This is why keeping %r15 is important
     // do first pipe
-    movq %rbp, %rdi
+    movq %rsp, %rdi
     movl $22, %eax
     syscall
     cmpq $-4096, %rax
     ja .fail
-    movq (%rbp), %r13
+    movq (%rsp), %r13
     // do second pipe
-    movq %rbp, %rdi
+    movq %rsp, %rdi
     movl $22, %eax
     syscall
     cmpq $-4096, %rax
     ja .fail
-    movq (%rbp), %r14
+    movq (%rsp), %r14
 
     // sysV x64 is little endian, so:
     //   - r13d has pipe 1 read half
@@ -179,6 +186,7 @@ _start:
 
     // %r13 and %r14 are finally free.
     leaq 16(%rbp), %r13
+    // NOTE: %r15 is not modified in the child code path, so it's still argc
     leaq 16(%rbp, %r15, 8), %r14
 
     // tries to execveat into PATH dirs with argv in %r13 and envp in %r14
@@ -208,6 +216,13 @@ _start:
     syscall
     hlt
 .Lprint_pipes:
+    //   - r13d has pipe 1 read half
+    //   - r13 >> 32 has pipe 1 write half
+    //   - r14d has pipe 2 read half
+    //   - r14 >> 32 has pipe 2 write half
+    // pipe 1 is for parent -> child
+    // pipe 2 is for child -> parent
+
     // close(%r13d), which is pipe 1 read half
     movl %r13d, %edi
     movl $3, %eax
@@ -222,34 +237,142 @@ _start:
     cmpq $-4096, %rax
     ja .fail
 
-    // set %r13 to our write fd
+    // we need to set %r13d to our write half, and %r13 >> 32 to our read half
+    // AKA %r13 top half -> %r13d, $r14d -> %r13 upper half
+    movl %r14d, %eax
     shrq $32, %r13
-    // set %r14 to our read fd
-    movl %r14d, %r14d
+    shlq $32, %rax
+    orq %rax, %r13
 .Lprint:
-    // %r12-15 are occupied, %rbx is the last register that syscalls don't clobber
-    // Since I'm considering adding a -0 option, put the separator in (%rbp)
-    movl $'\n, (%rbp)
+    // Since I'm considering adding a -0 option, put the separator in %r14
+    movl $'\n, %r14d
 
-    // TODO: do the actual printing
+    /* this is the structure that getdents64 writes
+    struct linux_dirent64 {
+        // 64-bit, not needed
+        ino64_t d_ino;
+        // 64-bit, not needed
+        off64_t d_off;
+        // the lenght of this dirent
+        unsigned short d_reclen; // 16 byte offset
+        // entry type
+        unsigned char d_type; // 18 byte offset
+        // null terminated name (of size d_reclen - 19)
+        char d_name[]; // 19 byte offset
+    };
+    */
 
+    // %r12 is occupied with dirfd array
+    // %r13 has the write and read fds
+    // %r14 is occupied with the separator
+    // %rsp, %rbp are for the stack
+    // This leaves %rbx, %r15
+    // finally, we do getdents64/write loop
+    movq %rbp, %r15
+    // "shrink" the stack to allow using offsets in the range [-128, 127],
+    // which allows for much shorter offset encodings
+    // for optimal shrinkage, we need `a` and `b`,
+    //     such that a < 127, b < 127, a + b = 144
+    // one such pair is 72 and 72.
+    // We write 72 bytes below %rsp, but that's in the redzone.
+    addq $72, %rsp
+.Lgetdents:
+    movl -4(%r15), %edi
+    leaq -72(%r12), %rdx
+    subq %rsp, %rdx
+    leaq 72(%rsp), %rsi
+    movl $217, %eax
+    syscall
+    cmpq $-4096, %rax
+    ja .fail
+    testq %rax, %rax
+    jz .Lgetdents_next_dir
+    // We only have %rbx left, but we need 2 register.
+    // Luckily, the ino64_t at 72(%rsp)
+    movq %r12, 72(%rsp)
+    movq %rax, %r12
+    leaq 72(%rsp), %rbx
+.Lstat_loop:
+    movzbl 18(%rbx), %eax
+    // x & ~8 == 0 iff (x == 0 || x == 8)
+    testb $-9, %al
+    jz .Ldo_stat
+    cmpb $10, %al
+    jne .Lstat_end
+.Ldo_stat:
+    movl -4(%r15), %edi
+    leaq 19(%rbx), %rsi
+    leaq -72(%rsp), %rdx
+    xorl %r10d, %r10d
+    movl $262, %eax
+    syscall
+    testq %rax, %rax
+    jnz .fail
+    // get st_mode at offset 24 (24 - 72 = -48)
+    movl -48(%rsp), %eax
+    // test if (st_mode & (S_IXUSR | S_IFMT)) == (S_IXUSR | S_IFREG)
+    andl $0xf040, %eax
+    cmpl $0x8040, %eax
+    jne .Lstat_end
+
+    // start preparing for write
+    movzwl 16(%rbx), %eax
+    // the name is up to 27 bytes shorter than the struct
+    // do name_size -= min(dirent_size, 28)
+    subl $28, %eax
+    movl $0, %edx
+    cmovnc %eax, %edx
+    // actually strlen + 1
+.Lstrlen:
+    addl $1, %edx
+    cmpb $0, -1(%rsi, %rdx)
+    jne .Lstrlen
+.Lstrlen_end:
+    movb %r14b, -1(%rsi, %rdx)
+    movl %r13d, %edi
+    leaq 19(%rbx), %rsi
+    movl $1, %eax
+    syscall
+    cmpq $-4096, %rax
+    ja .fail
+
+.Lstat_end:
+    movzwl 16(%rbx), %eax
+    addq %rax, %rbx
+    subq %rax, %r12
+    jnz .Lstat_loop
+    // restore %r12 from the unused ino64_t
+    movq 72(%rsp), %r12
+    jmp .Lgetdents
+.Lgetdents_next_dir:
+    subq $4, %r15
+    cmpq %r15, %r12
+    jne .Lgetdents
+
+    // set %r15 back to argc
+    movq (%rbp), %r15
     // if argc <= 1, exit right away
     xorl %edi, %edi
     cmpq $1, %r15
     jbe .exit
 
-    // close our write half, so that the other process can get EOF (%r13 is freed)
+    // restore the stack
+    addq $-72, %rsp
+
+    // close our write half, so that the other process can get EOF
     movl %r13d, %edi
     movl $3, %eax
     syscall
     cmpq $-4096, %rax
     ja .fail
+    // currently our read half is in %r13 >> 32, put it in %r13d
+    shrq $32, %r13
 
     // set %rbx to the remaining stack capacity and start reading
     movq %r12, %rbx
     subq %rsp, %rbx
 .Lread_child:
-    movl %r14d, %edi
+    movl %r13d, %edi
     movq %r12, %rsi
     subq %rbx, %rsi
     movq %rbx, %rdx
@@ -270,7 +393,7 @@ _start:
 
 .Lafter_reads:
     // close read half
-    movl %r14d, %edi
+    movl %r13d, %edi
     movl $3, %eax
     syscall
     cmpq $-4096, %rax

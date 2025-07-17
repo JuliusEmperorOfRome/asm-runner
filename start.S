@@ -371,9 +371,9 @@ _start:
     // EOF
     testq %rax, %rax
     jz .Lafter_reads
-    // filled buffer
+    // filled buffer, not great
     cmpq %rbx, %rax
-    je .Lafter_reads
+    je .fail
 
     subq %rax, %rbx
     jmp .Lread_child
@@ -387,6 +387,8 @@ _start:
     cmpq $-4096, %rax
     ja .fail
     jmp .Lwait_start
+
+    // wait can't touch %rbx
 .Lwait:
     // WIFEXITED(status) = ((status & 0x7f) == 0)
     // WEXITSTATUS(status) = ((status & 0xff00) >> 8)
@@ -396,7 +398,7 @@ _start:
     testw $0xff7f, (%rbp)
     jnz .fail
 .Lwait_start:
-    // wait4(-1, (%rsp), 0, 0)
+    // wait4(-1, (%rbp), 0, 0)
     movq $-1, %rdi
     movq %rbp, %rsi
     xorl %edx, %edx
@@ -406,5 +408,36 @@ _start:
     cmpq $-4096, %rax
     jbe .Lwait
 
-    xorl %edi, %edi
-    jmp .exit
+    // selector output is in %rsp..(%r12 - %rbx)
+    // validate what we read to avoid user error problems
+    movq %r12, %rcx
+    subq %rbx, %rcx
+    // read nothing
+    cmpq %rsp, %rcx
+    je .fail
+    movq %rsp, %rax
+    movzbl %r14b, %edx
+.Lfind_term:
+    cmpb %dl, (%rax)
+    je .Lcheck_term
+    addq $1, %rax
+    cmpq %rcx, %rax
+    jne .Lfind_term
+    // unterminated (the terminator is \n by default, no endline is fishy)
+    jmp .fail
+.Lcheck_term:
+    subq $1, %rcx
+    cmpq %rcx, %rax
+    // read data past the terminator
+    jne .fail
+    // change the terminator to '\0'
+    movb $0, (%rax)
+
+    // load old argv/envp into %r13/14
+    leaq 16(%rbp), %r13
+    leaq 16(%rbp, %r15, 8), %r14
+    // set argv[0] to name, argv[1] to nullptr
+    movq %rsp, (%r13)
+    movq $0, 8(%r13)
+
+    jmp .execve

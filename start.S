@@ -70,7 +70,6 @@ _start:
     shrl $8, %eax
     jz .print
 
-
     movq %rsp, %rdi
     movl $22, %eax
     syscall
@@ -113,6 +112,7 @@ _start:
     cmpq $-4096, %rax
     ja .fail
 
+    // remap stdin
     movl %ebx, %edi
     xorl %esi, %esi
     movl $33, %eax
@@ -120,6 +120,13 @@ _start:
     cmpq $-4096, %rax
     ja .fail
 
+    movl %ebx, %edi
+    movl $3, %eax
+    syscall
+    cmpq $-4096, %rax
+    ja .fail
+
+    // remap stdout
     movq %r12, %rdi
     shrq $32, %rdi
     movl $1, %esi
@@ -128,18 +135,70 @@ _start:
     cmpq $-4096, %rax
     ja .fail
 
-    movl %ebx, %edi
-    movl $3, %eax
-    syscall
-    cmpq $-4096, %rax
-    ja .fail
-
     movq %r12, %rdi
     shrq $32, %rdi
     movl $3, %eax
     syscall
     cmpq $-4096, %rax
     ja .fail
+
+    // prepare to fall into `.exec`
+    leaq 16(%rbp), %r14
+    leaq 24(%rbp), %rcx
+    // if separator is \0, then skip the additional "-0" argument
+    testb %r14b, %r14b
+    cmovz %rcx, %r14
+
+    movq %rsp, %rbx
+
+    // Assumes:
+    // - %r14 is argv
+    // - %r15 points to the contents of $PATH (AKA after "PATH=")
+    // - the memory in [%rbx, %rbp) is not referenced by the arguments
+.exec:
+    // envp -> %r13
+    movq (%rbp), %rax
+    leaq 16(%rbp, %rax, 8), %r13
+    // start by trying as absolute path
+    movq (%r14), %rdi
+.Lrestart_exec:
+    movq %r14, %rsi
+    movq %r13, %rdx
+    movl $59, %eax
+    syscall
+
+    movzbl (%r15), %eax
+    testb %al, %al
+    jz .fail
+    movq %rbx, %rdx
+.Lcopydir:
+    cmpq %rdx, %rbp
+    je .fail
+    addq $1, %r15
+    cmpb $':', %al
+    je .Lcopyname
+    movb %al, (%rdx)
+    addq $1, %rdx
+
+    movzbl (%r15), %eax
+    testb %al, %al
+    jnz .Lcopydir
+
+.Lcopyname:
+    // name pointer -> %rcx
+    movq (%r14), %rcx
+.Lcopyname_loop:
+    cmpq %rdx, %rbp
+    je .fail
+    movzbl (%rcx), %eax
+    movb %al, (%rdx)
+    addq $1, %rcx
+    addq $1, %rdx
+    testb %al, %al
+    jnz .Lcopyname_loop
+
+    movq %rbx, %rdi
+    jmp .Lrestart_exec
 
 .fail:
     movl $1, %edi

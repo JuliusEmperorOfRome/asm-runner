@@ -231,9 +231,14 @@ _start:
     // envp -> %rbx
     movq (%rbp), %rax
     leaq 16(%rbp, %rax, 8), %rbx
-    movl $.Lprint_loop, %edi
+    movl $.Lprint_loop_entry, %edi
     jmp .find_path
-.Lprint_loop:
+.Lprint_loop_top:
+    movq %r12, %rdi
+    movl $3, %eax
+    syscall
+    // ignore return value, since this is purely for reduced resource usage
+.Lprint_loop_entry:
     movzbl (%rbx), %eax
     testb %al, %al
     jz .Lprint_loop_end
@@ -241,15 +246,15 @@ _start:
     movl $.Lprint_loop_open, %edi
     jmp .next_dir
 .Lprint_loop_open:
-    // open(%rsp, O_DIRECTORY, 0)
+    // open(%rsp, O_DIRECTORY | O_CLOEXEC, 0)
     movq %rsp, %rdi
-    movl $0x10000, %esi
+    movl $0x90000, %esi
     xorl %edx, %edx
     movl $2, %eax
     syscall
     cmpq $-4096, %rax
     // If the $PATH is has a messed up directory, skip it
-    ja .Lprint_loop
+    ja .Lprint_loop_entry
     movq %rax, %r12
 .Lprint_loop_getdents:
     movq %rbp, %rdx
@@ -260,6 +265,8 @@ _start:
     syscall
     cmpq $-4096, %rax
     ja .fail
+    testq %rax, %rax
+    jz .Lprint_loop_top
     movq %rbx, (%rsp)
     movq %rax, %r13
     movq %rsp, %rbx
@@ -315,7 +322,8 @@ _start:
     subq %rax, %r13
     jnz .Lprint_loop_faccessat_loop
     movq (%rsp), %rbx
-    jmp .Lprint_loop
+    jmp .Lprint_loop_getdents
+    // ignore this
 .Lprint_loop_end:
 
     // exit if no child

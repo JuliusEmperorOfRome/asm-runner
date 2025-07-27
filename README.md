@@ -1,26 +1,22 @@
-# Listing executables in $PATH
+# Usage
 
-`$ ./asm-runner`
+`asm-runner` has two main modes of operation, described below.
 
-That's it.
-When run without arguments, it lists all files that the **user** can execute.
+## List $PATH mode
 
-# Launcher mode
+`$ ./asm-runner [-0]`
 
-`$ ./asm-runner command [args]..`
+Lists all files in `$PATH` that the user can execute, separated by newlines (`\n`).
+With `-0`, the output is separated with NUL (`\0`) instead. Executables for which
+the user doesn't have appropriate permissions will not be listed.
 
-In short, it uses `command [args]..` to select a file to execute.
+## Launcher mode
 
-More precisely, when asm-runner has arguments, it will spawn command with all
-arguments passed to it. It will then pass its output to the command, read the
-command's output. If the command exits successfully and the command's output
-contains exactly one newline as its last character, asm-runner will try to exec
-into the command named by the command's output.
+`$ ./asm-runner [-0] command [args]..`
 
-# BUGS
-
-Because of a [bug in execveat][1], asm-runner fails to launch interpreted
-programs (mostly meaning scripts starting with `#!`).
-
-
-[1]: <https://manpages.debian.org/unstable/manpages-dev/execveat.2.en.html#ENOENT>
+`asm-runner` uses `command [args]..` as a selector program. The selector receives
+the output of [List $PATH mode](#list_path_mode) on its stdin, and outputs the
+selection on its stdout. Then `asm-runner` checks that the selector exited
+successfully, the selection isn't empty and has exactly one separator, which is at
+the end. If the selection passses these checks, it is executed. By default the
+separator is newline, or NUL if `-0` was passed.

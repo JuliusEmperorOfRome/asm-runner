@@ -1,4 +1,4 @@
-EXECUTABLE := listcommands
+EXECUTABLE := asm-runner
 BUILD_DIR := ./build
 ASFLAGS := -g
 

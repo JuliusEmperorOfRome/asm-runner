@@ -1,12 +1,84 @@
-/// Registers preserved across syscalls:
-/// - %rsp: stack pointer
-/// - %rbp: base pointer (our stack is variable sized, no getting around this)
-/// - $r13: (input fd) << 32 | (output fd)
-/// - %r14: allocated for (launcher mode?) << 8 | (separator byte)
-/// - %r15: allocated for $PATH pointer (without "PATH=")
-/// - %rbx: free use
-/// - %r12: free use
+//! Registers preserved across syscalls:
+//! - %rsp: stack pointer
+//! - %rbp: base pointer (our stack is variable sized, no getting around this)
+//! - %rbx: free use
+//! - %r12: free use
+//! - %r13: free use
+//! - $r14: (input fd) << 32 | (output fd)
+//! - %r15: allocated for (launcher mode?) << 8 | (separator byte)
 .text
+/// Find the path variable and skip "PATH="
+/// Input:
+///   %rbx - envp
+///   %rdi - chain pointer
+/// Output:
+///   %rax - clobbered
+///   %rbx - pointer to PATH contents
+1:
+    addq $8, %rbx
+.find_path:
+    movq (%rbx), %rax
+    testq %rax, %rax
+    jz .fail
+    cmpb $'P', (%rax)
+    jne 1b
+    cmpb $'A', 1(%rax)
+    jne 1b
+    cmpb $'T', 2(%rax)
+    jne 1b
+    cmpb $'H', 3(%rax)
+    jne 1b
+    cmpb $'=', 4(%rax)
+    jne 1b
+    leaq 5(%rax), %rbx
+    jmp *%rdi
+/// Copy the next directory in path.
+/// Input:
+///   %rax - first character of path, not 0
+///   %rbx - points into path
+///   %rdx - output pointer (assumed to be in stack, checked against %rbp)
+///   %rdi - chain pointer
+/// Output:
+///   %rax - clobbered
+///   %rbx - points past read part of path or the null terminator
+///   %rdx - points to the output null terminator
+/// Only registers in the output section are modified
+///
+.next_dir:
+    cmpq %rdx, %rbp
+    je .fail
+    addq $1, %rbx
+    cmpb $':', %al
+    je 1f
+    movb %al, (%rdx)
+    movzbl (%rbx), %eax
+    addq $1, %rdx
+    testb %al, %al
+    jnz .next_dir
+1:
+    movb $0, (%rdx)
+    jmp *%rdi
+/// Copy string to stack buffer.
+/// Input:
+///   %rcx - input pointer
+///   %rdx - output pointer (assumed to be in stack, checked against %rbp)
+///   %rdi - chain pointer
+/// Output:
+///   %rax - clobbered
+///   %rcx - points to the input null terminator
+///   %rdx - points to the output null terminator
+1:
+    leaq 1(%rcx), %rcx
+    leaq 1(%rdx), %rdx
+.strcopy:
+    cmpq %rdx, %rbp
+    je .fail
+    movzbl (%rcx), %eax
+    movb %al, (%rdx)
+    testb %al, %al
+    jnz 1b
+    jmp *%rdi
+
 .global _start
 _start:
     // get argc
@@ -18,9 +90,9 @@ _start:
     addq %rdx, %rsp
     andq %rdx, %rsp
 
-    movl $'\n', %r14d
+    movl $'\n', %r15d
     cmpq $2, %rax
-    jb .Lfind_path
+    jb .Larg_handler_end
 
     // is argv[1] == "-0"?
     movq 16(%rbp), %rdx
@@ -33,40 +105,16 @@ _start:
 
     // %r14 = (argc != 2) << 8
     cmpq $2, %rax
-    setne %r14b
-    shll $8, %r14d
-    jmp .Lfind_path
+    setne %r15b
+    shll $8, %r15d
+    jmp .Larg_handler_end
 .Llf_with_child:
-    movl $('\n' + 256), %r14d
-
-.Lfind_path:
-    // %r14 is set, %rax is argc
-    // envp - 1 -> %rax
-    leaq 8(%rbp, %rax, 8), %rax
-.Lfind_top:
-    addq $8, %rax
-    // loading directly to %r14 would add a byte to every instruction, not cool
-    movq (%rax), %rdx
-    testq %rdx, %rdx
-    jz .fail
-    cmpb $'P', (%rdx)
-    jne .Lfind_top
-    cmpb $'A', 1(%rdx)
-    jne .Lfind_top
-    cmpb $'T', 2(%rdx)
-    jne .Lfind_top
-    cmpb $'H', 3(%rdx)
-    jne .Lfind_top
-    cmpb $'=', 4(%rdx)
-    jne .Lfind_top
-    cmpb $0, 5(%rdx)
-    je .fail
-    addq $5, %rdx
-    movq %rdx, %r15
+    movl $('\n' + 256), %r15d
+.Larg_handler_end:
 
     // go straight to .print if not in launcher mode
-    movl $1, %r13d
-    movl %r14d, %eax
+    movl $1, %r14d
+    movl %r15d, %eax
     shrl $8, %eax
     jz .print
 
@@ -94,9 +142,9 @@ _start:
 
     // pipes are stored such that:
     // - %ebx is child read half
-    // - (%rbx) >> 32 is parent write half 
+    // - (%rbx) >> 32 is parent write half
     // - %r12d is parent read half
-    // - (%r12) >> 32 is child write half 
+    // - (%r12) >> 32 is child write half
     // We need to close parent fds, and remap stdin/stdout
 
     movl %r12d, %edi
@@ -142,7 +190,7 @@ _start:
     cmpq $-4096, %rax
     ja .fail
 
-    // prepare to fall into `.exec`
+    // prepare to call `.exec`
     leaq 16(%rbp), %r14
     leaq 24(%rbp), %rcx
     // if separator is \0, then skip the additional "-0" argument
@@ -150,70 +198,15 @@ _start:
     cmovz %rcx, %r14
 
     movq %rsp, %rbx
+    jmp .exec
 
-    // Assumes:
-    // - %r14 is argv
-    // - %r15 points to the contents of $PATH (AKA after "PATH=")
-    // - the memory in [%rbx, %rbp) is not referenced by the arguments
-.exec:
-    // envp -> %r13
-    movq (%rbp), %rax
-    leaq 16(%rbp, %rax, 8), %r13
-    // start by trying as absolute path
-    movq (%r14), %rdi
-.Lrestart_exec:
-    movq %r14, %rsi
-    movq %r13, %rdx
-    movl $59, %eax
-    syscall
-
-    movzbl (%r15), %eax
-    testb %al, %al
-    jz .fail
-    movq %rbx, %rdx
-.Lcopydir:
-    cmpq %rdx, %rbp
-    je .fail
-    addq $1, %r15
-    cmpb $':', %al
-    je .Lcopyname
-    movb %al, (%rdx)
-    addq $1, %rdx
-
-    movzbl (%r15), %eax
-    testb %al, %al
-    jnz .Lcopydir
-
-.Lcopyname:
-    // name pointer -> %rcx
-    movq (%r14), %rcx
-.Lcopyname_loop:
-    cmpq %rdx, %rbp
-    je .fail
-    movzbl (%rcx), %eax
-    movb %al, (%rdx)
-    addq $1, %rcx
-    addq $1, %rdx
-    testb %al, %al
-    jnz .Lcopyname_loop
-
-    movq %rbx, %rdi
-    jmp .Lrestart_exec
-
-.fail:
-    movl $1, %edi
-.exit:
-    movl $60, %eax
-    syscall
-    // exit failed, hlt (stops the CPU if ring 0, otherwise death)
-    hlt
 .print_pipe_setup:
     // pipes are stored such that:
     // - %ebx is child read half
-    // - (%rbx) >> 32 is parent write half 
+    // - (%rbx) >> 32 is parent write half
     // - %r12d is parent read half
-    // - (%r12) >> 32 is child write half 
-    // We need to close the child fds and set up %r13
+    // - (%r12) >> 32 is child write half
+    // We need to close the child fds and set up %r14
 
     movl %ebx, %edi
     movl $3, %eax
@@ -228,25 +221,27 @@ _start:
     cmpq $-4096, %rax
     ja .fail
 
-    // we need %r13 = (%r12d << 32) | (%rbx >> 32)
-    movl %r12d, %r13d
+    // we need %r14 = (%r12d << 32) | (%rbx >> 32)
+    movl %r12d, %r14d
     shrq $32, %rbx
-    shlq $32, %r13
-    orq %rbx, %r13
+    shlq $32, %r14
+    orq %rbx, %r14
 .print:
+
+
     // exit if no child
-    movl %r14d, %eax
+    movl %r15d, %eax
     xorl %edi, %edi
     shrl $8, %eax
     jz .exit
 
     // close write half, set %r13 to read half
-    movl %r13d, %edi
+    movl %r14d, %edi
     movl $3, %eax
     syscall
     cmpq $-4096, %rax
     ja .fail
-    shrq $32, %r13
+    shrq $32, %r14
 
     jmp .Lwait_start
 .Lwait:
@@ -255,27 +250,110 @@ _start:
     // We're testing for successful exit, so
     // status & 0x7f == 0 and (status & 0xff00) >> 8 == 0
     // which is equivalent to (status & 0xff7f == 0)
-    testw $0xff7f, (%rbp)
+    testw $0xff7f, (%rsp)
     jnz .fail
 .Lwait_start:
-    // wait4(-1, (%rbp), 0, 0)
+    // wait4(-1, (%rsp), 0, 0)
     movq $-1, %rdi
-    movq %rbp, %rsi
+    movq %rsp, %rsi
     xorl %edx, %edx
     xorl %r10d, %r10d
     movl $61, %eax
     syscall
     cmpq $-4096, %rax
-    jbe .Lwait 
+    jbe .Lwait
 
-    // TODO: read selection
+    movq %rsp, %rbx
+.Lread_loop:
+    movl %r14d, %edi
+    movq %rbp, %rdx
+    movq %rbx, %rsi
+    subq %rbx, %rdx
+    xorl %eax, %eax
+    syscall
+    cmpq $-4096, %rax
+    ja .fail
+    addq %rax, %rbx
+    testq %rax, %rax
+    jnz .Lread_loop
 
     // close read half
-    movl %r13d, %edi
+    movl %r14d, %edi
     movl $3, %eax
     syscall
     cmpq $-4096, %rax
     ja .fail
 
-    xorl %edi, %edi
-    jmp .exit
+    // validate selection
+    cmpq %rsp, %rbx
+    je .fail
+    cmpb %r15b, -1(%rbx)
+    jne .fail
+    movq %rsp, %rax
+.Lpast_sep_loop:
+    addq $1, %rax
+    cmpb %r15b, -1(%rax)
+    jne .Lpast_sep_loop
+    // had more than one separator?
+    cmpq %rbx, %rax
+    jne .fail
+
+    movb $0, -1(%rax)
+
+    // set up argv
+    movq %rsp, 8(%rbp)
+    movq $0, 16(%rbp)
+    leaq 8(%rbp), %r14
+
+    // Assumes:
+    // - %r14 is argv
+    // - the memory in [%rbx, %rbp) is not referenced by the arguments
+.exec:
+    movq (%r14), %r12
+    movq %rbx, %r13
+    // envp -> %rbx
+    movq (%rbp), %rax
+    leaq 16(%rbp, %rax, 8), %rbx
+    // start by trying as absolute path
+    movq %r12, %rdi
+    movq %r14, %rsi
+    movq %rbx, %rdx
+    movl $59, %eax
+    syscall
+
+    movq %rbx, %r15
+    // Try from $PATH
+    movl $.Lfound_path, %edi
+    jmp .find_path
+.Lfound_path:
+    // set up .next_dir arguments
+    movzbl (%rbx), %eax
+    testb %al, %al
+    jz .fail
+    movq %r13, %rdx
+    movl $.Lappend_name, %edi
+    jmp .next_dir
+.Lappend_name:
+    cmpq %rdx, %rbp
+    je .fail
+    movb $'/', (%rdx)
+    addq $1, %rdx
+    // set up .strcopy arguments
+    movq %r12, %rcx
+    movl $.Lname_assembled, %edi
+    jmp .strcopy
+.Lname_assembled:
+    movq %r13, %rdi
+    movq %r14, %rsi
+    movq %r15, %rdx
+    movl $59, %eax
+    syscall
+    jmp .Lfound_path
+
+.fail:
+    movl $1, %edi
+.exit:
+    movl $60, %eax
+    syscall
+    // exit failed, hlt (stops the CPU if ring 0, otherwise death)
+    hlt

@@ -58,26 +58,6 @@
 1:
     movb $0, (%rdx)
     jmp *%rdi
-/// Copy string to stack buffer.
-/// Input:
-///   %rcx - input pointer
-///   %rdx - output pointer (assumed to be in stack, checked against %rbp)
-///   %rdi - chain pointer
-/// Output:
-///   %rax - clobbered
-///   %rcx - points to the input null terminator
-///   %rdx - points to the output null terminator
-1:
-    leaq 1(%rcx), %rcx
-    leaq 1(%rdx), %rdx
-.strcopy:
-    cmpq %rdx, %rbp
-    je .fail
-    movzbl (%rcx), %eax
-    movb %al, (%rdx)
-    testb %al, %al
-    jnz 1b
-    jmp *%rdi
 
 .global _start
 _start:
@@ -433,12 +413,20 @@ _start:
 .Lappend_name:
     // .next_dir already tested (%rdx) to write 0 there
     movb $'/', (%rdx)
-    addq $1, %rdx
-    // set up .strcopy arguments
+
     movq %r12, %rcx
-    movl $.Lname_assembled, %edi
-    jmp .strcopy
-.Lname_assembled:
+    jmp .Lstrcopy_entry
+.Lstrcopy_top:
+    addq $1, %rcx
+.Lstrcopy_entry:
+    addq $1, %rdx
+    cmpq %rbp, %rdx
+    je .fail
+    movzbl (%rcx), %eax
+    movb %al, (%rdx)
+    testb %al, %al
+    jnz .Lstrcopy_top
+
     movq %r13, %rdi
     movq %r14, %rsi
     movq %r15, %rdx

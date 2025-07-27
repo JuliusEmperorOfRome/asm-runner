@@ -194,7 +194,7 @@ _start:
     leaq 16(%rbp), %r14
     leaq 24(%rbp), %rcx
     // if separator is \0, then skip the additional "-0" argument
-    testb %r14b, %r14b
+    testb %r15b, %r15b
     cmovz %rcx, %r14
 
     movq %rsp, %rbx
@@ -228,6 +228,95 @@ _start:
     orq %rbx, %r14
 .print:
 
+    // envp -> %rbx
+    movq (%rbp), %rax
+    leaq 16(%rbp, %rax, 8), %rbx
+    movl $.Lprint_loop, %edi
+    jmp .find_path
+.Lprint_loop:
+    movzbl (%rbx), %eax
+    testb %al, %al
+    jz .Lprint_loop_end
+    movq %rsp, %rdx
+    movl $.Lprint_loop_open, %edi
+    jmp .next_dir
+.Lprint_loop_open:
+    // open(%rsp, O_DIRECTORY, 0)
+    movq %rsp, %rdi
+    movl $0x10000, %esi
+    xorl %edx, %edx
+    movl $2, %eax
+    syscall
+    cmpq $-4096, %rax
+    // If the $PATH is has a messed up directory, skip it
+    ja .Lprint_loop
+    movq %rax, %r12
+.Lprint_loop_getdents:
+    movq %rbp, %rdx
+    subq %rsp, %rdx
+    movq %r12, %rdi
+    movq %rsp, %rsi
+    movl $217, %eax
+    syscall
+    cmpq $-4096, %rax
+    ja .fail
+    movq %rbx, (%rsp)
+    movq %rax, %r13
+    movq %rsp, %rbx
+.Lprint_loop_faccessat_loop:
+    /* this is the structure that getdents64 writes
+    struct linux_dirent64 {
+        // 64-bit, not needed
+        ino64_t d_ino;
+        // 64-bit, not needed
+        off64_t d_off;
+        // the lenght of this dirent
+        unsigned short d_reclen; // 16 byte offset
+        // entry type
+        unsigned char d_type; // 18 byte offset
+        // null terminated name (of size d_reclen - 19)
+        char d_name[]; // 19 byte offset
+    };
+    */
+    movzbl 18(%rbx), %eax
+    testb $-9, %al
+    jz .Lprint_loop_do_faccessat
+    cmpb $10, %al
+    jne .Lprint_loop_skip_entry
+.Lprint_loop_do_faccessat:
+    movq %r12, %rdi
+    leaq 19(%rbx), %rsi
+    movl $1, %edx
+    movl $269, %eax
+    syscall
+    testq %rax, %rax
+    jnz .Lprint_loop_skip_entry
+
+    movl %r14d, %edi
+    leaq 19(%rbx), %rsi
+    movzwl 16(%rbx), %eax
+    // find the null terminator
+    subl $27, %eax
+    movl $0, %edx
+    cmovnc %eax, %edx
+.Lfind_term_loop:
+    addl $1, %edx
+    cmpb $0, -1(%rsi, %rdx)
+    jne .Lfind_term_loop
+    movb %r15b, -1(%rsi, %rdx)
+    movl $1, %eax
+    syscall
+    cmpq $-4096, %rax
+    ja .fail
+
+.Lprint_loop_skip_entry:
+    movzwl 16(%rbx), %eax
+    addq %rax, %rbx
+    subq %rax, %r13
+    jnz .Lprint_loop_faccessat_loop
+    movq (%rsp), %rbx
+    jmp .Lprint_loop
+.Lprint_loop_end:
 
     // exit if no child
     movl %r15d, %eax
@@ -334,8 +423,7 @@ _start:
     movl $.Lappend_name, %edi
     jmp .next_dir
 .Lappend_name:
-    cmpq %rdx, %rbp
-    je .fail
+    // .next_dir already tested (%rdx) to write 0 there
     movb $'/', (%rdx)
     addq $1, %rdx
     // set up .strcopy arguments
